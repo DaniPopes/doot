@@ -1,5 +1,6 @@
 use crate::store::Store;
 use anyhow::Result;
+use ignore::gitignore::GitignoreBuilder;
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
@@ -86,7 +87,22 @@ impl<'a> PlanBuilder<'a> {
 
         let mut builder = WalkBuilder::new(resolved_path);
         builder.standard_filters(false);
-        builder.add_ignore(ignore_file);
+        let mut ignore = GitignoreBuilder::new(resolved_path);
+        if ignore_file.exists() {
+            if let Some(error) = ignore.add(ignore_file) {
+                return Err(error.into());
+            }
+        }
+        let ignore = ignore.build()?;
+        builder.filter_entry(move |entry| {
+            entry.depth() == 0
+                || !ignore
+                    .matched(
+                        entry.path(),
+                        entry.file_type().is_some_and(|ft| ft.is_dir()),
+                    )
+                    .is_ignore()
+        });
         let walker = builder.build();
 
         for entry in walker.filter_map(|e| e.ok()) {
@@ -158,6 +174,54 @@ impl<'a> PlanBuilder<'a> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::fs;
+
+    #[test]
+    fn import_matches_nested_allowlist_relative_to_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let group = temp.path().join("repo/config");
+        let source = temp.path().join("system/config");
+        fs::create_dir_all(&group).unwrap();
+        fs::create_dir_all(source.join("zed")).unwrap();
+        fs::write(source.join("zed/settings.json"), b"{}").unwrap();
+        fs::write(source.join("zed/auth.json"), b"secret").unwrap();
+        fs::write(source.join("unrelated"), b"ignored").unwrap();
+        let ignore = group.join(".dootignore");
+        fs::write(&ignore, "*\n!zed/\n!zed/settings.json\n").unwrap();
+
+        let store = MockStore::new();
+        let entries = PlanBuilder::new(&store)
+            .build_import(&group, &source, &ignore)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path, Path::new("zed/settings.json"));
+    }
+
+    #[test]
+    fn import_without_ignore_file_includes_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("config"), b"content").unwrap();
+        let group = temp.path().join("repo");
+        let store = MockStore::new();
+        let entries = PlanBuilder::new(&store)
+            .build_import(&group, &source, &group.join(".dootignore"))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path, Path::new("config"));
+    }
+
+    #[test]
+    fn import_rejects_invalid_ignore_patterns() {
+        let temp = tempfile::tempdir().unwrap();
+        let ignore = temp.path().join(".dootignore");
+        fs::write(&ignore, "{unclosed\n").unwrap();
+        let store = MockStore::new();
+        assert!(PlanBuilder::new(&store)
+            .build_import(temp.path(), temp.path(), &ignore)
+            .is_err());
+    }
 
     struct MockStore {
         files: HashMap<PathBuf, Vec<u8>>,
